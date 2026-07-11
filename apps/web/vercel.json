@@ -1,0 +1,6 @@
+{
+  "framework": "sveltekit",
+  "buildCommand": "pnpm build",
+  "outputDirectory": ".svelte-kit/vercel",
+  "installCommand": "pnpm install"
+}
