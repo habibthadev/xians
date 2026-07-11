@@ -6,6 +6,7 @@
     "dev": "concurrently -n api,web -c blue,green \"make dev-api\" \"pnpm dev:web\"",
     "dev:web": "pnpm --filter @xians/web dev",
     "dev:api": "make dev-api",
+    "build": "pnpm --filter @xians/shared-types build && pnpm --filter @xians/web build",
     "build:web": "pnpm --filter @xians/web build",
     "build:api": "make build-api",
     "test:web": "pnpm --filter @xians/web check",
