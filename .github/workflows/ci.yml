@@ -26,14 +26,11 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
           cache-dependency-path: apps/api/go.sum
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
-          working-directory: apps/api
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest && golangci-lint run
 
       - name: go vet
         run: go vet ./...
@@ -60,12 +57,15 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Generate svelte-kit types
+        run: npx svelte-kit sync
 
       - name: svelte-check
         run: pnpm svelte-check
@@ -84,6 +84,3 @@ jobs:
 
       - name: Deploy API
         run: flyctl deploy --config apps/api/fly.toml --remote-only
-
-      - name: Deploy Web
-        run: flyctl deploy --config apps/web/fly.toml --remote-only
