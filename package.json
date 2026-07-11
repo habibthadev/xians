@@ -1,0 +1,21 @@
+{
+  "name": "xians",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,green \"make dev-api\" \"pnpm dev:web\"",
+    "dev:web": "pnpm --filter @xians/web dev",
+    "dev:api": "make dev-api",
+    "build:web": "pnpm --filter @xians/web build",
+    "build:api": "make build-api",
+    "test:web": "pnpm --filter @xians/web check",
+    "test:api": "make test-api",
+    "lint": "pnpm -r lint && make lint-api"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.3"
+  }
+}
