@@ -22,9 +22,9 @@ type Batch struct {
 	ExpiresAt      *time.Time
 	PasswordHash   *string `gorm:"type:text"`
 	MaxDownloads   *int
-	DownloadCount  int    `gorm:"default:0"`
-	OwnerToken     string `gorm:"type:text;not null"`
-	UploaderIPHash string `gorm:"type:text;not null"`
+	DownloadCount  int         `gorm:"default:0"`
+	OwnerToken     string      `gorm:"type:text;not null"`
+	UploaderIPHash string      `gorm:"type:text;not null"`
 	Status         BatchStatus `gorm:"type:text;not null;default:pending"`
 }
 

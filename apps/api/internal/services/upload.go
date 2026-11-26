@@ -46,9 +46,9 @@ var (
 		"image/gif":  ".gif",
 	}
 	supportedVideoTypes = map[string]string{
-		"video/mp4":          ".mp4",
-		"video/quicktime":    ".mov",
-		"video/webm":         ".webm",
+		"video/mp4":       ".mp4",
+		"video/quicktime": ".mov",
+		"video/webm":      ".webm",
 	}
 )
 
@@ -64,9 +64,9 @@ func getAllSupportedTypes() map[string]string {
 }
 
 type UploadService struct {
-	cfg    *config.Config
-	repo   *models.BatchRepository
-	store  *storage.R2Client
+	cfg   *config.Config
+	repo  *models.BatchRepository
+	store *storage.R2Client
 }
 
 func NewUploadService(cfg *config.Config, repo *models.BatchRepository, store *storage.R2Client) *UploadService {
@@ -315,28 +315,48 @@ func (s *GalleryService) Unlock(ctx context.Context, slug, password string) (str
 	return batch.Slug, nil
 }
 
-func (s *GalleryService) GetFileDownloadURL(ctx context.Context, slug, fileID string, hasAccess bool) (string, error) {
+// resolveFileAccess loads the batch/file after checking gallery status and
+// password access. Shared by download (counts a download) and view (does not).
+func (s *GalleryService) resolveFileAccess(ctx context.Context, slug, fileID string, hasAccess bool) (*models.Batch, *models.File, error) {
 	batch, err := s.repo.FindBySlug(ctx, slug)
 	if err != nil {
-		return "", fmt.Errorf("find batch: %w", err)
+		return nil, nil, fmt.Errorf("find batch: %w", err)
 	}
 	if batch == nil || batch.Status != models.BatchStatusActive {
-		return "", ErrGalleryNotActive
+		return nil, nil, ErrGalleryNotActive
 	}
 
 	if batch.PasswordHash != nil && !hasAccess {
-		return "", ErrPasswordRequired
+		return nil, nil, ErrPasswordRequired
 	}
 
-	var file *models.File
 	for i := range batch.Files {
 		if batch.Files[i].ID == fileID {
-			file = &batch.Files[i]
-			break
+			return batch, &batch.Files[i], nil
 		}
 	}
-	if file == nil {
-		return "", ErrBatchNotFound
+	return nil, nil, ErrBatchNotFound
+}
+
+func (s *GalleryService) presignFile(ctx context.Context, batch *models.Batch, file *models.File) (string, error) {
+	supported := getAllSupportedTypes()
+	ext, ok := supported[file.ContentType]
+	if !ok {
+		ext = ""
+	}
+	url, err := s.store.PresignGetURL(ctx, batch.Slug, file.ID, ext)
+	if err != nil {
+		return "", fmt.Errorf("presign get: %w", err)
+	}
+	return url, nil
+}
+
+// GetFileDownloadURL returns a short-lived presigned URL and counts the
+// download toward the gallery's limit.
+func (s *GalleryService) GetFileDownloadURL(ctx context.Context, slug, fileID string, hasAccess bool) (string, error) {
+	batch, file, err := s.resolveFileAccess(ctx, slug, fileID, hasAccess)
+	if err != nil {
+		return "", err
 	}
 
 	if batch.MaxDownloads != nil {
@@ -355,56 +375,18 @@ func (s *GalleryService) GetFileDownloadURL(ctx context.Context, slug, fileID st
 		}
 	}
 
-	supported := getAllSupportedTypes()
-	ext, ok := supported[file.ContentType]
-	if !ok {
-		ext = ""
-	}
-
-	url, err := s.store.PresignGetURL(ctx, slug, fileID, ext)
-	if err != nil {
-		return "", fmt.Errorf("presign get: %w", err)
-	}
-
-	return url, nil
+	return s.presignFile(ctx, batch, file)
 }
 
-func (s *GalleryService) StreamFile(ctx context.Context, slug, fileID string, hasAccess bool) (io.ReadCloser, string, int64, error) {
-	batch, err := s.repo.FindBySlug(ctx, slug)
+// GetFileViewURL returns a presigned URL for inline viewing without counting
+// a download. The caller redirects straight to R2, so media streams from
+// Cloudflare (with Range support) instead of proxying through this server.
+func (s *GalleryService) GetFileViewURL(ctx context.Context, slug, fileID string, hasAccess bool) (string, error) {
+	batch, file, err := s.resolveFileAccess(ctx, slug, fileID, hasAccess)
 	if err != nil {
-		return nil, "", 0, fmt.Errorf("find batch: %w", err)
+		return "", err
 	}
-	if batch == nil || batch.Status != models.BatchStatusActive {
-		return nil, "", 0, ErrGalleryNotActive
-	}
-
-	if batch.PasswordHash != nil && !hasAccess {
-		return nil, "", 0, ErrPasswordRequired
-	}
-
-	var file *models.File
-	for i := range batch.Files {
-		if batch.Files[i].ID == fileID {
-			file = &batch.Files[i]
-			break
-		}
-	}
-	if file == nil {
-		return nil, "", 0, ErrBatchNotFound
-	}
-
-	supported := getAllSupportedTypes()
-	ext, ok := supported[file.ContentType]
-	if !ok {
-		ext = ""
-	}
-
-	body, contentType, contentLength, err := s.store.GetObjectStream(ctx, slug, fileID, ext)
-	if err != nil {
-		return nil, "", 0, fmt.Errorf("get object stream: %w", err)
-	}
-
-	return body, *contentType, contentLength, nil
+	return s.presignFile(ctx, batch, file)
 }
 
 func (s *GalleryService) StreamZip(ctx context.Context, slug string, w http.ResponseWriter, hasAccess bool) error {
@@ -520,6 +502,11 @@ func (s *CleanupService) CleanupExpired(ctx context.Context) error {
 		if err := s.repo.DeleteByID(ctx, b.ID); err != nil {
 			log.Ctx(ctx).Error().Err(err).Str("slug", b.Slug).Msg("failed to delete stale mongo doc")
 		}
+	}
+
+	// Prune rate-limit counters so the table does not grow unbounded.
+	if err := s.repo.PruneRateLimits(ctx, now.Add(-24*time.Hour)); err != nil {
+		log.Ctx(ctx).Warn().Err(err).Msg("failed to prune rate limits")
 	}
 
 	return nil

@@ -37,7 +37,7 @@ func main() {
 
 	log.Info().Msg("starting reaper")
 
-	dbConn, err := database.Connect(cfg.DatabaseURL)
+	dbConn, err := database.Connect(cfg.DatabaseURL, 2, 1)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to connect to database")
 	}

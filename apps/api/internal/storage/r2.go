@@ -172,18 +172,6 @@ func (r *R2Client) PresignGetURL(ctx context.Context, batchID, fileID, ext strin
 	return req.URL, nil
 }
 
-func (r *R2Client) GetObjectStream(ctx context.Context, batchID, fileID, ext string) (io.ReadCloser, *string, int64, error) {
-	key := objectKey(batchID, fileID, ext)
-	result, err := r.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &r.bucket,
-		Key:    &key,
-	})
-	if err != nil {
-		return nil, nil, 0, err
-	}
-	return result.Body, result.ContentType, *result.ContentLength, nil
-}
-
 func (r *R2Client) HeadObject(ctx context.Context, batchID, fileID, ext string) (bool, error) {
 	key := objectKey(batchID, fileID, ext)
 	_, err := r.client.HeadObject(ctx, &s3.HeadObjectInput{

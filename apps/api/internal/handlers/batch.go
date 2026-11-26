@@ -3,8 +3,6 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"net/http"
 
 	"xians/api/internal/models"
@@ -13,6 +11,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
 )
+
+// maxProxyUploadBytes caps the legacy proxy upload endpoint. Vercel rejects
+// request bodies over 4.5 MB, so anything larger must use the presigned R2
+// URL issued by /api/batches/init.
+const maxProxyUploadBytes = 4_500_000
 
 type BatchHandler struct {
 	uploadSvc  *services.UploadService
@@ -61,8 +64,18 @@ func (h *BatchHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	batchID := chi.URLParam(r, "id")
 	fileID := chi.URLParam(r, "fileId")
 
+	// Vercel caps request bodies at 4.5 MB; large files must go straight to
+	// the presigned R2 URL returned by /api/batches/init.
+	r.Body = http.MaxBytesReader(w, r.Body, maxProxyUploadBytes)
+
 	if err := h.uploadSvc.UploadFile(r.Context(), batchID, fileID, r.Body); err != nil {
 		log.Ctx(r.Context()).Error().Err(err).Str("batchId", batchID).Str("fileId", fileID).Msg("upload file failed")
+
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "file too large for proxy upload; use the presigned upload URL")
+			return
+		}
 
 		switch {
 		case errors.Is(err, services.ErrBatchNotFound):
@@ -163,7 +176,7 @@ func (h *BatchHandler) Unlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	setGalleryCookie(w, slug, r.TLS != nil)
+	setGalleryCookie(w, slug, r)
 
 	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
 }
@@ -200,7 +213,7 @@ func (h *BatchHandler) ViewFile(w http.ResponseWriter, r *http.Request) {
 	fileID := chi.URLParam(r, "fileId")
 
 	hasAccess := hasGalleryAccess(r, slug)
-	body, contentType, contentLength, err := h.gallerySvc.StreamFile(r.Context(), slug, fileID, hasAccess)
+	url, err := h.gallerySvc.GetFileViewURL(r.Context(), slug, fileID, hasAccess)
 	if err != nil {
 		log.Ctx(r.Context()).Error().Err(err).Str("slug", slug).Str("fileId", fileID).Msg("view file failed")
 
@@ -216,12 +229,12 @@ func (h *BatchHandler) ViewFile(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	defer body.Close()
 
-	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
-	w.Header().Set("Cache-Control", "public, max-age=86400, s-maxage=3600")
-	io.Copy(w, body)
+	// Redirect to the presigned R2 URL: media streams straight from
+	// Cloudflare with Range/seek support instead of proxying through this
+	// server (which would hit Vercel's request duration limits).
+	w.Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
+	http.Redirect(w, r, url, http.StatusFound)
 }
 
 func (h *BatchHandler) DownloadZip(w http.ResponseWriter, r *http.Request) {
