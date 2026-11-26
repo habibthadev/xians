@@ -100,3 +100,8 @@ func (r *BatchRepository) FindStalePending(ctx context.Context, cutoff time.Time
 func (r *BatchRepository) DeleteByID(ctx context.Context, id string) error {
 	return r.db.WithContext(ctx).Delete(&Batch{}, "id = ?", id).Error
 }
+
+// PruneRateLimits deletes rate-limit counters older than the cutoff.
+func (r *BatchRepository) PruneRateLimits(ctx context.Context, before time.Time) error {
+	return r.db.WithContext(ctx).Where("window_start < ?", before).Delete(&RateLimit{}).Error
+}

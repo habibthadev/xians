@@ -8,34 +8,42 @@ import (
 )
 
 type Config struct {
-	MaxFileSizeMB      int
-	MaxBatchSizeMB     int
-	MaxFilesPerBatch   int
-	DefaultTTLHours    int
-	DatabaseURL        string
-	R2AccountID        string
-	R2AccessKeyID      string
-	R2SecretAccessKey  string
-	R2BucketName       string
-	R2PublicHostname   string
-	JWTSecret          string
-	AllowedOrigin      string
-	RateLimitInitPerMin   int
-	RateLimitUnlockPerMin int
+	MaxFileSizeMB          int
+	MaxBatchSizeMB         int
+	MaxFilesPerBatch       int
+	DefaultTTLHours        int
+	DatabaseURL            string
+	R2AccountID            string
+	R2AccessKeyID          string
+	R2SecretAccessKey      string
+	R2BucketName           string
+	R2PublicHostname       string
+	JWTSecret              string
+	AllowedOrigin          string
+	RateLimitInitPerMin    int
+	RateLimitUnlockPerMin  int
 	RateLimitReportPerHour int
-	Port               string
+	Port                   string
+	AutoMigrate            bool
+	CronSecret             string
+	DBMaxOpenConns         int
+	DBMaxIdleConns         int
 }
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		MaxFileSizeMB:        getEnvInt("MAX_FILE_SIZE_MB", 100),
-		MaxBatchSizeMB:       getEnvInt("MAX_BATCH_SIZE_MB", 500),
-		MaxFilesPerBatch:     getEnvInt("MAX_FILES_PER_BATCH", 20),
-		DefaultTTLHours:      getEnvInt("DEFAULT_TTL_HOURS", 168),
-		RateLimitInitPerMin:   getEnvInt("RATE_LIMIT_INIT_PER_MIN", 10),
-		RateLimitUnlockPerMin: getEnvInt("RATE_LIMIT_UNLOCK_PER_MIN", 5),
+		MaxFileSizeMB:          getEnvInt("MAX_FILE_SIZE_MB", 100),
+		MaxBatchSizeMB:         getEnvInt("MAX_BATCH_SIZE_MB", 500),
+		MaxFilesPerBatch:       getEnvInt("MAX_FILES_PER_BATCH", 20),
+		DefaultTTLHours:        getEnvInt("DEFAULT_TTL_HOURS", 168),
+		RateLimitInitPerMin:    getEnvInt("RATE_LIMIT_INIT_PER_MIN", 10),
+		RateLimitUnlockPerMin:  getEnvInt("RATE_LIMIT_UNLOCK_PER_MIN", 5),
 		RateLimitReportPerHour: getEnvInt("RATE_LIMIT_REPORT_PER_HOUR", 3),
-		Port:                 getEnv("PORT", "8080"),
+		Port:                   getEnv("PORT", defaultPort()),
+		AutoMigrate:            getEnvBool("AUTO_MIGRATE", true),
+		CronSecret:             os.Getenv("CRON_SECRET"),
+		DBMaxOpenConns:         getEnvInt("DB_MAX_OPEN_CONNS", 5),
+		DBMaxIdleConns:         getEnvInt("DB_MAX_IDLE_CONNS", 2),
 	}
 
 	required := map[string]string{
@@ -85,6 +93,25 @@ func getEnv(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	if val := os.Getenv(key); val != "" {
+		b, err := strconv.ParseBool(val)
+		if err == nil {
+			return b
+		}
+	}
+	return fallback
+}
+
+// defaultPort matches the platform contract: Vercel routes container
+// functions to $PORT (default 80), local development uses 8080.
+func defaultPort() string {
+	if os.Getenv("VERCEL") != "" {
+		return "80"
+	}
+	return "8080"
 }
 
 func getEnvInt(key string, fallback int) int {

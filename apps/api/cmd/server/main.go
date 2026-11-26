@@ -50,7 +50,7 @@ func main() {
 		Int("maxBatchMB", cfg.MaxBatchSizeMB).
 		Msg("starting xians-api")
 
-	dbConn, err := database.Connect(cfg.DatabaseURL)
+	dbConn, err := database.Connect(cfg.DatabaseURL, cfg.DBMaxOpenConns, cfg.DBMaxIdleConns)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to connect to database")
 	}
@@ -62,8 +62,10 @@ func main() {
 	}()
 	log.Info().Msg("connected to database")
 
-	if err := dbConn.DB.AutoMigrate(&models.Batch{}, &models.File{}); err != nil {
-		log.Fatal().Err(err).Msg("failed to run migrations")
+	if cfg.AutoMigrate {
+		if err := dbConn.DB.AutoMigrate(&models.Batch{}, &models.File{}, &models.RateLimit{}); err != nil {
+			log.Fatal().Err(err).Msg("failed to run migrations")
+		}
 	}
 
 	repo := models.NewBatchRepository(dbConn.DB)
@@ -81,9 +83,12 @@ func main() {
 
 	uploadSvc := services.NewUploadService(cfg, repo, r2Client)
 	gallerySvc := services.NewGalleryService(repo, r2Client)
+	cleanupSvc := services.NewCleanupService(repo, r2Client)
 	batchHandler := handlers.NewBatchHandler(uploadSvc, gallerySvc)
+	cronHandler := handlers.NewCronHandler(cleanupSvc)
 
 	handlers.SetJWTSecret(cfg.JWTSecret)
+	handlers.SetCronSecret(cfg.CronSecret)
 
 	r := chi.NewRouter()
 
@@ -93,17 +98,19 @@ func main() {
 	r.Use(chimw.RequestID)
 	r.Use(chimw.Logger)
 
-	initLimiter := middleware.NewRateLimiter(cfg.RateLimitInitPerMin, time.Minute)
-	unlockLimiter := middleware.NewRateLimiter(cfg.RateLimitUnlockPerMin, time.Minute)
-	reportLimiter := middleware.NewRateLimiter(cfg.RateLimitReportPerHour, time.Hour)
+	initLimiter := middleware.NewRateLimiter(dbConn.DB, cfg.RateLimitInitPerMin, time.Minute)
+	unlockLimiter := middleware.NewRateLimiter(dbConn.DB, cfg.RateLimitUnlockPerMin, time.Minute)
+	reportLimiter := middleware.NewRateLimiter(dbConn.DB, cfg.RateLimitReportPerHour, time.Hour)
 
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/health", batchHandler.Health)
 
+		// Vercel Cron triggers this (see vercel.json); replaces cmd/reaper
+		// as the scheduled cleanup job.
+		r.Get("/cron/cleanup", cronHandler.Cleanup)
+
 		r.Route("/batches", func(r chi.Router) {
-			r.With(middleware.RateLimit(initLimiter, func(req *http.Request) string {
-				return req.RemoteAddr
-			})).Post("/init", batchHandler.Init)
+			r.With(middleware.RateLimit(initLimiter, middleware.ClientIP)).Post("/init", batchHandler.Init)
 
 			r.Post("/{id}/complete", batchHandler.Complete)
 			r.Post("/{id}/files/{fileId}/upload", batchHandler.UploadFile)
@@ -112,24 +119,24 @@ func main() {
 		r.Route("/g/{slug}", func(r chi.Router) {
 			r.Get("/", batchHandler.GetGallery)
 			r.With(middleware.RateLimit(unlockLimiter, func(req *http.Request) string {
-				return req.URL.Path + ":" + req.RemoteAddr
+				return req.URL.Path + ":" + middleware.ClientIP(req)
 			})).Post("/unlock", batchHandler.Unlock)
 			r.Get("/files/{fileId}/view", batchHandler.ViewFile)
 			r.Get("/files/{fileId}", batchHandler.DownloadFile)
 			r.Get("/zip", batchHandler.DownloadZip)
-			r.With(middleware.RateLimit(reportLimiter, func(req *http.Request) string {
-				return req.RemoteAddr
-			})).Post("/report", batchHandler.Report)
+			r.With(middleware.RateLimit(reportLimiter, middleware.ClientIP)).Post("/report", batchHandler.Report)
 			r.Delete("/", batchHandler.Delete)
 		})
 	})
 
 	srv := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:    ":" + cfg.Port,
+		Handler: r,
+		// Let the platform (Vercel/Fly) enforce overall request deadlines;
+		// only guard against slow headers here so long zip streams and large
+		// proxy uploads are not cut off mid-response.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {

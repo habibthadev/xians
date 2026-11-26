@@ -10,7 +10,7 @@ Built by [habibthadev](https://habibthadev.tech).
 - **Password protection** — optionally protect galleries with a password. Recipients enter the password to access files.
 - **Expiring links** — choose from preset TTLs (24h, 7d, 30d, never) or set a download count limit.
 - **Direct-to-cloud uploads** — files stream directly to Cloudflare R2 via presigned URLs, zero server buffering.
-- **View vs download** — image/video previews use a streaming proxy (no download count), actual downloads use presigned URLs (counts decremented).
+- **View vs download** — image/video previews redirect to presigned R2 URLs (no download count, Range/seek supported), actual downloads use presigned URLs and count toward the limit.
 - **Gallery grid** — responsive file grid with hover preview overlay and fullscreen lightbox.
 - **Bulk download** — download all files as a single ZIP archive.
 - **OG image generation** — dynamic social preview images with Satori (JSX→SVG) + resvg (SVG→PNG), matching the app's Geist/Anton font stack and theme colors.
@@ -51,7 +51,7 @@ xians/
 
 ### Infrastructure
 - **Frontend host**: Vercel (Node.js 22.x, serverless functions)
-- **Backend host**: Fly.io (Docker, single region)
+- **Backend host**: Vercel (Go framework preset; Fly.io kept as rollback)
 - **Database**: PostgreSQL (managed, e.g. Neon, Fly Postgres)
 - **Storage**: Cloudflare R2 (S3-compatible, no egress fees)
 - **Package manager**: pnpm workspaces
@@ -95,7 +95,11 @@ cp apps/web/.env.example apps/web/.env
 | `R2_BUCKET_NAME` | R2 bucket name |
 | `R2_PUBLIC_HOSTNAME` | R2 public bucket hostname (for presigned URLs) |
 | `ALLOWED_ORIGIN` | CORS origin (e.g. `http://localhost:5173` for dev) |
-| `PORT` | Server port (default: 8080) |
+| `PORT` | Server port (default: 8080 locally, 80 on Vercel) |
+| `CRON_SECRET` | Bearer token for `/api/cron/cleanup` (Vercel Cron) |
+| `AUTO_MIGRATE` | Run schema migrations on startup (default: `true`) |
+| `DB_MAX_OPEN_CONNS` | Postgres connections per instance (default: 5) |
+| `DB_MAX_IDLE_CONNS` | Idle Postgres connections per instance (default: 2) |
 
 **Web** (`apps/web/.env`):
 
@@ -176,21 +180,68 @@ internal/
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/batches/init` | Initialize a new upload batch |
-| `PUT` | `/api/batches/{id}/files/{fileId}` | Upload file (presigned R2 URL) |
+| `POST` | `/api/batches/init` | Initialize a new upload batch (returns presigned R2 PUT URLs) |
+| `PUT` | *presigned R2 URL* | Browser uploads the file straight to R2 |
+| `POST` | `/api/batches/{id}/files/{fileId}/upload` | Legacy proxy upload, capped at 4.5 MB (Vercel body limit) |
 | `POST` | `/api/batches/{id}/complete` | Finalize batch, create gallery |
 | `GET` | `/api/g/{slug}` | Get gallery metadata + files |
 | `POST` | `/api/g/{slug}/unlock` | Unlock password-protected gallery |
-| `GET` | `/api/g/{slug}/files/{fileId}` | Download file (counts toward limit) |
-| `GET` | `/api/g/{slug}/files/{fileId}/view` | View file (streaming proxy, no count) |
-| `GET` | `/api/g/{slug}/zip` | Download all files as ZIP |
+| `GET` | `/api/g/{slug}/files/{fileId}` | Download file (302 to presigned R2 URL, counts toward limit) |
+| `GET` | `/api/g/{slug}/files/{fileId}/view` | View file (302 to presigned R2 URL, no count) |
+| `GET` | `/api/g/{slug}/zip` | Download all files as ZIP (streamed) |
 | `POST` | `/api/g/{slug}/report` | Report a gallery |
 | `DELETE` | `/api/g/{slug}` | Delete gallery (requires owner token) |
+| `GET` | `/api/cron/cleanup` | Cleanup expired galleries (Vercel Cron, auth via `CRON_SECRET`) |
 | `GET` | `/api/health` | Health check |
 
 ## Deployment
 
-### API → Fly.io
+### API → Vercel
+
+The API is a standard `net/http` (chi) server, deployed with Vercel's **Go
+framework preset** (`apps/api/vercel.json` sets `"framework": "go"`). Vercel
+builds `cmd/server/main.go` and routes traffic to `$PORT` (set `PORT=80` in
+project settings; the code also defaults to 80 when `VERCEL` is set).
+
+1. Create a Vercel project with **Root Directory** `apps/api`.
+2. Set environment variables (same names as `apps/api/.env`):
+
+   | Variable | Notes |
+   |---|---|
+   | `DATABASE_URL` | Use a pooled connection string (e.g. Neon/Supabase pooler) |
+   | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_PUBLIC_HOSTNAME` | Cloudflare R2 |
+   | `JWT_SIGNING_SECRET` | ≥ 32 chars |
+   | `ALLOWED_ORIGIN` | Web origin, e.g. `https://xians.vercel.app` |
+   | `PORT` | `80` |
+   | `CRON_SECRET` | Random string; Vercel Cron sends it as `Authorization: Bearer …` |
+   | `AUTO_MIGRATE` | `true` for the first deploy, `false` afterwards (optional) |
+   | `DB_MAX_OPEN_CONNS` / `DB_MAX_IDLE_CONNS` | Keep small; each instance pools its own connections |
+
+3. Deploy. `vercel.json` already registers a daily cron
+   (`0 3 * * *`) hitting `GET /api/cron/cleanup`, which replaces the old
+   `cmd/reaper` job (`cmd/reaper` still exists for manual runs).
+4. In the **web** project, set `PUBLIC_API_URL` / `API_URL` to the API
+   project's URL (e.g. `https://xians-api.vercel.app`).
+
+Why this works on Vercel:
+
+- **Uploads never touch the server** — `init` returns presigned R2 PUT URLs
+  and the browser uploads directly (R2 bucket CORS must allow the web origin
+  with `PUT` and the `Content-Type` header).
+- **View/download redirect** to presigned R2 URLs, so media streams from
+  Cloudflare with Range/seek support instead of proxying through the function
+  (which would hit the 4.5 MB body / request-duration limits).
+- **Rate limits live in Postgres** (`rate_limits` table), so they hold across
+  instances and cold starts.
+- **Cleanup runs via Vercel Cron** instead of a resident process (instances
+  scale to zero after 5 minutes without traffic).
+- The connection pool is capped per instance to avoid exhausting Postgres.
+
+The legacy `POST /api/batches/{id}/files/{fileId}/upload` proxy endpoint is
+capped at 4.5 MB (Vercel's request body limit); the app itself uses
+presigned URLs.
+
+### API → Fly.io (alternative / rollback)
 
 ```bash
 cd apps/api
@@ -221,8 +272,8 @@ Set environment variables in Vercel dashboard:
 
 | Variable | Value |
 |---|---|
-| `PUBLIC_API_URL` | `https://xians-api.fly.dev` |
-| `API_URL` | `https://xians-api.fly.dev` |
+| `PUBLIC_API_URL` | API project URL, e.g. `https://xians-api.vercel.app` |
+| `API_URL` | API project URL, e.g. `https://xians-api.vercel.app` |
 
 ## Attribution
 
